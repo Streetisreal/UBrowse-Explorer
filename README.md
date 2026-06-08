@@ -13,3 +13,9 @@ streetisreal
 MacOS Source Code
 https://github.com/thatpicoder/ubrowse-macos
 Thank you thatpicoder for porting UBrowse Explorer to MacOS!
+
+Requirements
+
+Windows 8.1 or later
+macOS 11.0 (Big Sur) or later
+android 7.0 or later 
