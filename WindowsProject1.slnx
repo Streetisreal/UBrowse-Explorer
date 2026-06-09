@@ -13,6 +13,10 @@
 #include <wininet.h>
 #include "WebView2.h"
 
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK SettingsWndProc(HWND, UINT, WPARAM, LPARAM);
+void ResizeLayout(int width, int height);
+
 #pragma comment(lib, "dwmapi.lib") 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uxtheme.lib")
@@ -25,10 +29,6 @@
 
 using namespace Microsoft::WRL;
 namespace fs = std::filesystem;
-
-#define CURRENT_VERSION L"1.3"
-#define GITHUB_VERSION_URL L"https://raw.githubusercontent.com/Streetisreal/UBrowse-Explorer/main/main/version.txt"
-#define GITHUB_RELEASE_URL L"https://github.com/Streetisreal/UBrowse-Explorer/releases/latest"
 
 #define IDC_ADDRESS_BAR 1001
 #define IDC_GO_BUTTON 1002
@@ -50,10 +50,10 @@ namespace fs = std::filesystem;
 
 #define EASTER_EGG_HOTKEY_ID 1
 
-#define CURRENT_COMMIT_HASH "your_current_commit_hash_here" 
+#define CURRENT_VERSION "1.3"
 
-#define GITHUB_API_URL L"https://api.github.com/repos/Streetisreal/UBrowse-Explorer/releases/"
-#define GITHUB_RELEASE_URL L"https://github.com/Streetisreal/UBrowse-Explorer/release/"
+#define GITHUB_VERSION_URL L"https://raw.githubusercontent.com/Streetisreal/UBrowse-Explorer/main/version.txt"
+#define GITHUB_RELEASE_URL L"https://github.com/Streetisreal/UBrowse-Explorer/releases/latest"
 
 struct BrowserTab {
     ComPtr<ICoreWebView2Controller> controller;
@@ -90,40 +90,6 @@ const wchar_t* FLAPPY_BIRD_HTML = LR"html(
     function loop() { if (!gameOver) { update(); draw(); requestAnimationFrame(loop); } else { ctx.fillStyle = "black"; ctx.font = "bold 40px Arial"; ctx.fillText("Game Over - Press Space to Restart", canvas.width / 2 - 320, canvas.height / 2); } } loop();
 </script></body></html>
 )html";
-
-LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
-LRESULT CALLBACK SettingsWndProc(HWND, UINT, WPARAM, LPARAM);
-void ResizeLayout(int width, int height);
-void ApplyTheme(HWND hwnd, BOOL darkMode);
-
-DWORD WINAPI CheckForUpdatesThread(LPVOID lpParam) {
-    HINTERNET hInternet = InternetOpen(L"UBrowse AutoUpdater", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
-    if (hInternet) {
-        HINTERNET hUrl = InternetOpenUrl(hInternet, GITHUB_VERSION_URL, NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE, 0);
-        if (hUrl) {
-            char buffer[128];
-            DWORD bytesRead;
-            if (InternetReadFile(hUrl, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0) {
-                buffer[bytesRead] = '\0';
-                std::string latestVer(buffer);
-
-                latestVer.erase(latestVer.find_last_not_of(" \n\r\t") + 1);
-
-                std::string currentVer(CURRENT_VERSION, CURRENT_VERSION + wcslen(CURRENT_VERSION));
-
-                if (latestVer != currentVer && !latestVer.empty()) {
-                    int msgboxID = MessageBox(hWndMain, L"A new version of UBrowse is available! Do you want to download it from GitHub?", L"Update Available", MB_ICONINFORMATION | MB_YESNO);
-                    if (msgboxID == IDYES) {
-                        ShellExecute(NULL, L"open", GITHUB_RELEASE_URL, NULL, NULL, SW_SHOWNORMAL);
-                    }
-                }
-            }
-            InternetCloseHandle(hUrl);
-        }
-        InternetCloseHandle(hInternet);
-    }
-    return 0;
-}
 
 std::wstring GenerateHistoryHTML() {
     std::wstring html = L"<html><head><title>History</title><style>body{font-family:Segoe UI, Arial; background:#1e1e1e; color:#e0e0e0; padding:20px;} a{color:#4da6ff; text-decoration:none;} a:hover{text-decoration:underline;} li{margin-bottom:10px;}</style></head><body><h1>Browsing History</h1><ul>";
@@ -183,7 +149,9 @@ void CreateNewTab(std::wstring startUrl) {
     g_tabs.push_back(BrowserTab());
     g_tabs[newTabIndex].currentUrl = startUrl;
 
-    TCITEM tie = { 0 }; tie.mask = TCIF_TEXT; tie.pszText = (LPWSTR)L"New Tab";
+    TCITEM tie = { 0 };
+    tie.mask = TCIF_TEXT;
+    tie.pszText = (LPWSTR)L"New Tab";
     TabCtrl_InsertItem(hWndTabs, newTabIndex, &tie);
     TabCtrl_SetCurSel(hWndTabs, newTabIndex);
 
@@ -192,11 +160,14 @@ void CreateNewTab(std::wstring startUrl) {
             if (controller != nullptr) {
                 int activeIndex = -1;
                 for (int i = 0; i < g_tabs.size(); i++) {
-                    if (!g_tabs[i].controller) { activeIndex = i; break; }
+                    if (!g_tabs[i].controller) {
+                        activeIndex = i; break;
+                    }
                 }
 
                 if (activeIndex != -1) {
                     g_tabs[activeIndex].controller = controller;
+                    g_tabs[activeIndex].webview = nullptr;
                     controller->get_CoreWebView2(&g_tabs[activeIndex].webview);
                     auto webview = g_tabs[activeIndex].webview;
 
@@ -206,26 +177,18 @@ void CreateNewTab(std::wstring startUrl) {
                             [](ICoreWebView2* sender, IUnknown* args) -> HRESULT {
                                 int foundIndex = -1;
                                 for (int i = 0; i < g_tabs.size(); i++) {
-                                    if (g_tabs[i].webview.Get() == sender) { foundIndex = i; break; }
+                                    if (g_tabs[i].webview.Get() == sender) {
+                                        foundIndex = i; break;
+                                    }
                                 }
                                 if (foundIndex != -1) {
-                                    LPWSTR title, uri;
+                                    LPWSTR title;
                                     sender->get_DocumentTitle(&title);
-                                    sender->get_Source(&uri);
-
-                                    TCITEM tie = { 0 }; tie.mask = TCIF_TEXT; tie.pszText = title;
+                                    TCITEM tie = { 0 };
+                                    tie.mask = TCIF_TEXT;
+                                    tie.pszText = title;
                                     TabCtrl_SetItem(hWndTabs, foundIndex, &tie);
-
-                                    if (!g_isIncognito && uri && title) {
-                                        std::wstring suri(uri);
-                                        if (suri.find(L"ubrowse://") != 0 && suri.find(L"data:text/html") != 0) {
-                                            std::wofstream file("history.txt", std::ios::app);
-                                            file << suri << L"|" << title << L"\n";
-                                        }
-                                    }
-
-                                    if (title) CoTaskMemFree(title);
-                                    if (uri) CoTaskMemFree(uri);
+                                    CoTaskMemFree(title);
                                 }
                                 return S_OK;
                             }).Get(), &token);
@@ -234,17 +197,28 @@ void CreateNewTab(std::wstring startUrl) {
                     webview->add_WebResourceRequested(
                         Callback<ICoreWebView2WebResourceRequestedEventHandler>(
                             [](ICoreWebView2* sender, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
-                                ComPtr<ICoreWebView2WebResourceRequest> request; args->get_Request(&request);
-                                LPWSTR uri; request->get_Uri(&uri);
+                                ComPtr<ICoreWebView2WebResourceRequest> request;
+                                args->get_Request(&request);
+                                LPWSTR uri;
+                                request->get_Uri(&uri);
                                 if (uri) {
-                                    std::wstring url(uri); CoTaskMemFree(uri);
-                                    if (url.rfind(L"chrome-extension://", 0) == 0) return S_OK;
-                                    const wchar_t* blockedDomains[] = { L"doubleclick.net", L"googleadservices.com", L"googlesyndication.com" };
+                                    std::wstring url(uri);
+                                    CoTaskMemFree(uri);
+
+                                    if (url.rfind(L"chrome-extension://", 0) == 0) {
+                                        return S_OK;
+                                    }
+
+                                    const wchar_t* blockedDomains[] = {
+                                        L"doubleclick.net", L"googleadservices.com", L"googlesyndication.com",
+                                        L"amazon-adsystem.com", L"taboola.com", L"outbrain.com"
+                                    };
                                     for (const auto& domain : blockedDomains) {
                                         if (url.find(domain) != std::wstring::npos) {
                                             ComPtr<ICoreWebView2WebResourceResponse> response;
                                             g_env->CreateWebResourceResponse(nullptr, 403, L"Blocked", L"", &response);
                                             args->put_Response(response.Get());
+                                            SendMessage(hWndStatus, SB_SETTEXT, 0, (LPARAM)_T("Domain Ad Blocked!"));
                                             break;
                                         }
                                     }
@@ -252,21 +226,62 @@ void CreateNewTab(std::wstring startUrl) {
                                 return S_OK;
                             }).Get(), nullptr);
 
-                    LPCWSTR jsScript = L"setInterval(() => { const skipBtn = document.querySelector('.ytp-ad-skip-button'); if (skipBtn) skipBtn.click(); }, 50);";
+                    LPCWSTR jsScript = L" \
+                        const style = document.createElement('style'); \
+                        style.innerHTML = ` \
+                            ytd-ad-slot-renderer, \
+                            ytd-companion-slot-renderer, \
+                            ytd-player-legacy-desktop-watch-ads-renderer, \
+                            ytd-promoted-sparkles-web-renderer, \
+                            .ytd-video-masthead-ad-v3-renderer, \
+                            .ytp-ad-image-overlay, \
+                            div#root.style-scope.ytd-display-ad-renderer, \
+                            div.ad-container { display: none !important; } \
+                        `; \
+                        document.head.appendChild(style); \
+                        setInterval(() => { \
+                            const skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button'); \
+                            if (skipBtn) { skipBtn.click(); } \
+                            const isAdPlaying = document.querySelector('.ad-showing, .ytp-ad-player-overlay'); \
+                            if (isAdPlaying) { \
+                                const video = document.querySelector('video'); \
+                                if (video && !isNaN(video.duration)) { \
+                                    video.playbackRate = 16.0; \
+                                    video.currentTime = video.duration - 0.1; \
+                                } \
+                            } \
+                            const adOverlay = document.querySelector('.ytp-ad-overlay-close-button'); \
+                            if (adOverlay) { adOverlay.click(); } \
+                        }, 50); \
+                    ";
                     webview->AddScriptToExecuteOnDocumentCreated(jsScript, nullptr);
+
+                    if (g_extensionsEnabled) {
+                        fs::path extDir = "extensions";
+                        if (!fs::exists(extDir)) {
+                            fs::create_directory(extDir);
+                        }
+                        else {
+                            for (const auto& entry : fs::directory_iterator(extDir)) {
+                                if (entry.path().extension() == ".js") {
+                                    std::wstring customScript = LoadExtensionScript(entry.path());
+                                    if (!customScript.empty()) {
+                                        webview->AddScriptToExecuteOnDocumentCreated(customScript.c_str(), nullptr);
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     for (int i = 0; i < g_tabs.size(); i++) {
                         if (g_tabs[i].controller) g_tabs[i].controller->put_IsVisible(i == activeIndex);
                     }
 
-                    RECT bounds; GetClientRect(hWndMain, &bounds); ResizeLayout(bounds.right, bounds.bottom);
+                    RECT bounds; GetClientRect(hWndMain, &bounds);
+                    ResizeLayout(bounds.right, bounds.bottom);
 
                     if (startUrl == L"ubrowse://flap") {
                         webview->NavigateToString(FLAPPY_BIRD_HTML);
-                    }
-                    else if (startUrl == L"ubrowse://history") {
-                        std::wstring histHtml = GenerateHistoryHTML();
-                        webview->NavigateToString(histHtml.c_str());
                     }
                     else {
                         webview->Navigate(startUrl.c_str());
@@ -298,7 +313,6 @@ int CALLBACK WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
     }
     else {
         LoadSettings();
-        CreateThread(NULL, 0, CheckForUpdatesThread, NULL, 0, NULL);
     }
 
     fs::path ublockFullPath = fs::absolute("ublock");
@@ -452,21 +466,37 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
-    case WM_SIZE: ResizeLayout(LOWORD(lParam), HIWORD(lParam)); break;
-    case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT: case WM_CTLCOLORBTN: {
-        if (g_isDarkMode) { SetTextColor((HDC)wParam, RGB(255, 255, 255)); SetBkColor((HDC)wParam, RGB(32, 32, 32)); static HBRUSH hDarkBrush = CreateSolidBrush(RGB(32, 32, 32)); return (INT_PTR)hDarkBrush; }
+    case WM_SIZE:
+        ResizeLayout(static_cast<int>(LOWORD(lParam)), static_cast<int>(HIWORD(lParam)));
+        break;
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORBTN: {
+        if (g_isDarkMode) {
+            SetTextColor((HDC)wParam, RGB(255, 255, 255));
+            SetBkColor((HDC)wParam, RGB(32, 32, 32));
+            static HBRUSH hDarkBrush = CreateSolidBrush(RGB(32, 32, 32));
+            return (INT_PTR)hDarkBrush;
+        }
         return DefWindowProc(hWnd, message, wParam, lParam);
     }
+
     case WM_NOTIFY: {
         if (((LPNMHDR)lParam)->code == TCN_SELCHANGE) {
             int currentTab = TabCtrl_GetCurSel(hWndTabs);
-            for (int i = 0; i < g_tabs.size(); i++) { if (g_tabs[i].controller) g_tabs[i].controller->put_IsVisible(i == currentTab); }
-            RECT rect; GetClientRect(hWnd, &rect); ResizeLayout(rect.right, rect.bottom);
+            for (size_t i = 0; i < g_tabs.size(); i++) {
+                if (g_tabs[i].controller) g_tabs[i].controller->put_IsVisible(i == (size_t)currentTab);
+            }
+            RECT rect; GetClientRect(hWnd, &rect);
+            ResizeLayout(static_cast<int>(rect.right), static_cast<int>(rect.bottom));
         }
         break;
     }
+
     case WM_COMMAND: {
-        int wmId = LOWORD(wParam); int currentTab = TabCtrl_GetCurSel(hWndTabs);
+        int wmId = LOWORD(wParam);
+        int currentTab = TabCtrl_GetCurSel(hWndTabs);
 
         if (wmId == IDC_INCOGNITO_BUTTON) {
             wchar_t exePath[MAX_PATH];
@@ -475,27 +505,34 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         else if (wmId == IDC_SETTINGS_BUTTON) {
             if (!IsWindow(hWndSettingsWindow)) {
-                hWndSettingsWindow = CreateWindowEx(0, _T("SettingsWindowClass"), _T("UBrowse Settings"), WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 400, 300, hWndMain, NULL, GetModuleHandle(NULL), NULL);
+                hWndSettingsWindow = CreateWindowEx(0, L"SettingsWindowClass", L"UBrowse Settings", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 400, 300, hWndMain, NULL, GetModuleHandle(NULL), NULL);
             }
             else {
                 SetForegroundWindow(hWndSettingsWindow);
             }
         }
-        else if (wmId == IDC_NEW_TAB_BUTTON) { CreateNewTab(g_homePageUrl); }
+        else if (wmId == IDC_NEW_TAB_BUTTON) {
+            CreateNewTab(g_homePageUrl);
+        }
         else if (wmId == IDC_CLOSE_TAB_BUTTON) {
-            if (currentTab >= 0 && currentTab < g_tabs.size()) {
+            if (currentTab >= 0 && (size_t)currentTab < g_tabs.size()) {
                 if (g_tabs[currentTab].controller) g_tabs[currentTab].controller->Close();
-                g_tabs.erase(g_tabs.begin() + currentTab); TabCtrl_DeleteItem(hWndTabs, currentTab);
-                if (g_tabs.empty()) PostQuitMessage(0);
+                g_tabs.erase(g_tabs.begin() + currentTab);
+                TabCtrl_DeleteItem(hWndTabs, currentTab);
+
+                if (g_tabs.empty()) {
+                    PostQuitMessage(0);
+                }
                 else {
-                    int newSel = (currentTab >= g_tabs.size()) ? g_tabs.size() - 1 : currentTab;
+                    int newSel = (currentTab >= (int)g_tabs.size()) ? (int)g_tabs.size() - 1 : currentTab;
                     TabCtrl_SetCurSel(hWndTabs, newSel);
                     if (g_tabs[newSel].controller) g_tabs[newSel].controller->put_IsVisible(TRUE);
-                    RECT rect; GetClientRect(hWnd, &rect); ResizeLayout(rect.right, rect.bottom);
+                    RECT rect; GetClientRect(hWnd, &rect);
+                    ResizeLayout(static_cast<int>(rect.right), static_cast<int>(rect.bottom));
                 }
             }
         }
-        else if (currentTab >= 0 && currentTab < g_tabs.size() && g_tabs[currentTab].webview) {
+        else if (currentTab >= 0 && (size_t)currentTab < g_tabs.size() && g_tabs[currentTab].webview) {
             auto webview = g_tabs[currentTab].webview;
             if (wmId == IDC_GO_BUTTON) {
                 int length = GetWindowTextLength(hWndEdit);
@@ -512,7 +549,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                         webview->NavigateToString(histHtml.c_str());
                     }
                     else {
-                        if (url.find(L"://") == std::wstring::npos) { url = L"https://" + url; SetWindowTextW(hWndEdit, url.c_str()); }
+                        if (url.find(L"://") == std::wstring::npos) {
+                            url = L"https://" + url;
+                            SetWindowTextW(hWndEdit, url.c_str());
+                        }
                         webview->Navigate(url.c_str());
                     }
                 }
