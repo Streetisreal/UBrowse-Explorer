@@ -1,6 +1,3 @@
-Here is your code with all the single-line comments (//) completely removed:
-
-C++
 #include <windows.h>
 #include <stdlib.h>
 #include <string>
