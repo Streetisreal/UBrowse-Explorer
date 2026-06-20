@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <uxtheme.h>
 #include <wininet.h>
+#include <iomanip>
 #include "WebView2.h"
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -40,6 +41,7 @@ namespace fs = std::filesystem;
 #define IDC_CLOSE_TAB_BUTTON 1008
 #define IDC_SETTINGS_BUTTON 1009 
 #define IDC_INCOGNITO_BUTTON 1010
+#define BOOKMARK_BASE_ID 3000
 
 #define IDC_CHK_DARKMODE 2001
 #define IDC_CHK_EXTENSIONS 2002
@@ -47,11 +49,12 @@ namespace fs = std::filesystem;
 #define IDC_LIST_EXTENSIONS 2004
 #define IDC_EDIT_HOMEPAGE 2005
 #define IDC_LBL_HOMEPAGE 2006
+#define IDC_CMB_SEARCH 2007
+#define IDC_LBL_SEARCH 2008
 
 #define EASTER_EGG_HOTKEY_ID 1
 
 #define CURRENT_VERSION "1.3"
-
 #define GITHUB_VERSION_URL L"https://raw.githubusercontent.com/Streetisreal/UBrowse-Explorer/main/version.txt"
 #define GITHUB_RELEASE_URL L"https://github.com/Streetisreal/UBrowse-Explorer/releases/latest"
 
@@ -61,16 +64,24 @@ struct BrowserTab {
     std::wstring currentUrl;
 };
 
+struct Bookmark {
+    std::wstring name;
+    std::wstring url;
+};
+
 HWND hWndMain, hWndEdit, hWndButton, hWndBack, hWndForward, hWndStatus, hWndTabs, hWndNewTab, hWndCloseTab, hWndSettings, hWndIncognito;
 HWND hWndSettingsWindow = NULL;
 WNDPROC OldEditProc;
 
 ComPtr<ICoreWebView2Environment> g_env;
 std::vector<BrowserTab> g_tabs;
+std::vector<Bookmark> g_bookmarks;
+std::vector<HWND> g_bookmarkButtons;
 
 BOOL g_isDarkMode = TRUE;
 BOOL g_extensionsEnabled = TRUE;
 BOOL g_isIncognito = FALSE;
+int g_searchEngine = 0; 
 std::wstring g_homePageUrl = L"https://www.streetisreal.com/ubrowse-landing-page/";
 
 const wchar_t* FLAPPY_BIRD_HTML = LR"html(
@@ -91,6 +102,12 @@ const wchar_t* FLAPPY_BIRD_HTML = LR"html(
 </script></body></html>
 )html";
 
+const wchar_t* UBROWSE_ABOUT_HTML = LR"html(
+<!DOCTYPE html><html><head><title>About UBrowse</title>
+<style>body{font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background:#1e1e1e; color:#fff; text-align:center; padding-top:50px;} h1{color:#4da6ff; font-size:48px; margin-bottom: 5px;} .container{background:#2a2a2a; border-radius:10px; display:inline-block; padding:40px; box-shadow: 0 4px 8px rgba(0,0,0,0.5);} p{color:#ccc; font-size:18px;} a{color:#70c5ce;}</style>
+</head><body><div class="container"><h1>UBrowse Explorer</h1><p>Version 1.4</p><p>A lightweight, custom web browser built with C++ and Microsoft Edge WebView2.</p><p>&copy; 2026 Streetisreal. All rights reserved.</p></div></body></html>
+)html";
+
 std::wstring GenerateHistoryHTML() {
     std::wstring html = L"<html><head><title>History</title><style>body{font-family:Segoe UI, Arial; background:#1e1e1e; color:#e0e0e0; padding:20px;} a{color:#4da6ff; text-decoration:none;} a:hover{text-decoration:underline;} li{margin-bottom:10px;}</style></head><body><h1>Browsing History</h1><ul>";
     std::wifstream file("history.txt");
@@ -107,10 +124,30 @@ std::wstring GenerateHistoryHTML() {
     return html;
 }
 
+std::wstring GetSearchUrl(const std::wstring& query) {
+    std::wstring searchBase;
+    if (g_searchEngine == 1) searchBase = L"https://www.bing.com/search?q=";
+    else if (g_searchEngine == 2) searchBase = L"https://duckduckgo.com/?q=";
+    else searchBase = L"https://www.google.com/search?q=";
+
+    std::wstring encoded;
+    for (wchar_t c : query) {
+        if (iswalnum(c)) encoded += c;
+        else if (c == L' ') encoded += L'+';
+        else {
+            wchar_t buf[10];
+            swprintf(buf, 10, L"%%%02X", (unsigned char)c);
+            encoded += buf;
+        }
+    }
+    return searchBase + encoded;
+}
+
 void LoadSettings() {
     std::ifstream file("config.conf");
     if (file.is_open()) {
         file >> g_isDarkMode >> g_extensionsEnabled;
+        if (!(file >> g_searchEngine)) g_searchEngine = 0;
         std::string url;
         if (file >> url) {
             int size_needed = MultiByteToWideChar(CP_UTF8, 0, url.c_str(), (int)url.size(), NULL, 0);
@@ -127,8 +164,30 @@ void SaveSettings() {
         int size_needed = WideCharToMultiByte(CP_UTF8, 0, g_homePageUrl.c_str(), (int)g_homePageUrl.size(), NULL, 0, NULL, NULL);
         std::string url(size_needed, 0);
         WideCharToMultiByte(CP_UTF8, 0, g_homePageUrl.c_str(), (int)g_homePageUrl.size(), &url[0], size_needed, NULL, NULL);
-        file << g_isDarkMode << " " << g_extensionsEnabled << " " << url;
+        file << g_isDarkMode << " " << g_extensionsEnabled << " " << g_searchEngine << " " << url;
         file.close();
+    }
+}
+
+void LoadBookmarks(HWND parent) {
+    std::wifstream file("bookmarks.txt");
+    if (!file.is_open()) return;
+
+    std::wstring line;
+    int id = BOOKMARK_BASE_ID;
+    while (std::getline(file, line)) {
+        size_t delim = line.find(L'|');
+        if (delim != std::wstring::npos) {
+            Bookmark b;
+            b.name = line.substr(0, delim);
+            b.url = line.substr(delim + 1);
+            g_bookmarks.push_back(b);
+
+            HWND btn = CreateWindowEx(0, _T("BUTTON"), b.name.c_str(), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, parent, (HMENU)(UINT_PTR)id, GetModuleHandle(NULL), NULL);
+            SendMessage(btn, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            g_bookmarkButtons.push_back(btn);
+            id++;
+        }
     }
 }
 
@@ -283,6 +342,13 @@ void CreateNewTab(std::wstring startUrl) {
                     if (startUrl == L"ubrowse://flap") {
                         webview->NavigateToString(FLAPPY_BIRD_HTML);
                     }
+                    else if (startUrl == L"ubrowse://history") {
+                        std::wstring histHtml = GenerateHistoryHTML();
+                        webview->NavigateToString(histHtml.c_str());
+                    }
+                    else if (startUrl == L"ubrowse://about") {
+                        webview->NavigateToString(UBROWSE_ABOUT_HTML);
+                    }
                     else {
                         webview->Navigate(startUrl.c_str());
                     }
@@ -309,7 +375,7 @@ int CALLBACK WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
     std::wstring cmdLine = GetCommandLineW();
     if (cmdLine.find(L"--incognito") != std::wstring::npos) {
         g_isIncognito = TRUE;
-        g_isDarkMode = TRUE; 
+        g_isDarkMode = TRUE;
     }
     else {
         LoadSettings();
@@ -348,6 +414,9 @@ int CALLBACK WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
     hWndCloseTab = CreateWindowEx(0, _T("BUTTON"), _T("X"), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWndMain, (HMENU)IDC_CLOSE_TAB_BUTTON, hInstance, NULL);
     hWndSettings = CreateWindowEx(0, _T("BUTTON"), _T("Settings"), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWndMain, (HMENU)IDC_SETTINGS_BUTTON, hInstance, NULL);
     hWndIncognito = CreateWindowEx(0, _T("BUTTON"), _T("Incog"), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hWndMain, (HMENU)IDC_INCOGNITO_BUTTON, hInstance, NULL);
+
+    LoadBookmarks(hWndMain);
+
     hWndTabs = CreateWindowEx(0, WC_TABCONTROL, _T(""), WS_CHILD | WS_VISIBLE | TCS_TABS | TCS_FIXEDWIDTH, 0, 0, 0, 0, hWndMain, (HMENU)IDC_TAB_CONTROL, hInstance, NULL);
     SetWindowTheme(hWndTabs, L"Explorer", NULL);
     hWndStatus = CreateWindowEx(0, STATUSCLASSNAME, NULL, WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hWndMain, (HMENU)IDC_STATUS_BAR, hInstance, NULL);
@@ -362,6 +431,10 @@ int CALLBACK WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
     OldEditProc = (WNDPROC)SetWindowLongPtr(hWndEdit, GWLP_WNDPROC, (LONG_PTR)EditProc);
 
     ShowWindow(hWndMain, nCmdShow); UpdateWindow(hWndMain);
+
+    RECT bounds;
+    GetClientRect(hWndMain, &bounds);
+    ResizeLayout(bounds.right, bounds.bottom);
 
     std::wstring userDataFolder = g_isIncognito ? (fs::temp_directory_path() / L"UBrowseIncognito").wstring() : L"";
     LPCWSTR folderPtr = userDataFolder.empty() ? nullptr : userDataFolder.c_str();
@@ -397,11 +470,24 @@ void ResizeLayout(int width, int height) {
     MoveWindow(hWndIncognito, cx, 5, incogBtnWidth, barHeight, TRUE); cx += incogBtnWidth + 5;
     MoveWindow(hWndSettings, cx, 5, settingsBtnWidth, barHeight, TRUE);
 
-    int tabY = 40, tabHeight = 25; MoveWindow(hWndTabs, 0, tabY, width, tabHeight, TRUE);
+    int bookmarkY = 40;
+    int bookmarkHeight = g_bookmarks.empty() ? 0 : 25;
+    if (!g_bookmarks.empty()) {
+        int bx = 5;
+        for (HWND btn : g_bookmarkButtons) {
+            int bWidth = 100; 
+            MoveWindow(btn, bx, bookmarkY, bWidth, bookmarkHeight, TRUE);
+            bx += bWidth + 5;
+        }
+    }
+
+    int tabY = bookmarkY + bookmarkHeight;
+    int tabHeight = 25;
+    MoveWindow(hWndTabs, 0, tabY, width, tabHeight, TRUE);
 
     int currentTab = TabCtrl_GetCurSel(hWndTabs);
     if (currentTab >= 0 && currentTab < g_tabs.size() && g_tabs[currentTab].controller) {
-        RECT bounds = { 0, tabY + tabHeight, width, height - statusHeight };
+        RECT bounds = { 0, tabY + tabHeight, width, height - statusHeight - (tabY + tabHeight) };
         g_tabs[currentTab].controller->put_Bounds(bounds);
     }
 }
@@ -415,11 +501,17 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
         HWND hChkExt = CreateWindowEx(0, L"BUTTON", L"Enable Extensions", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 20, 50, 150, 25, hWnd, (HMENU)IDC_CHK_EXTENSIONS, GetModuleHandle(NULL), NULL);
         SendMessage(hChkExt, BM_SETCHECK, g_extensionsEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
 
-        CreateWindowEx(0, L"STATIC", L"Homepage URL:", WS_CHILD | WS_VISIBLE, 20, 90, 150, 20, hWnd, (HMENU)IDC_LBL_HOMEPAGE, GetModuleHandle(NULL), NULL);
+        CreateWindowEx(0, L"STATIC", L"Preferred Search:", WS_CHILD | WS_VISIBLE, 20, 90, 150, 20, hWnd, (HMENU)IDC_LBL_SEARCH, GetModuleHandle(NULL), NULL);
+        HWND hCmb = CreateWindowEx(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 160, 90, 150, 100, hWnd, (HMENU)IDC_CMB_SEARCH, GetModuleHandle(NULL), NULL);
+        SendMessage(hCmb, CB_ADDSTRING, 0, (LPARAM)L"Google");
+        SendMessage(hCmb, CB_ADDSTRING, 0, (LPARAM)L"Bing");
+        SendMessage(hCmb, CB_ADDSTRING, 0, (LPARAM)L"DuckDuckGo");
+        SendMessage(hCmb, CB_SETCURSEL, g_searchEngine, 0);
 
-        HWND hEditHome = CreateWindowEx(0, L"EDIT", g_homePageUrl.c_str(), WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 20, 110, 340, 25, hWnd, (HMENU)IDC_EDIT_HOMEPAGE, GetModuleHandle(NULL), NULL);
+        CreateWindowEx(0, L"STATIC", L"Homepage URL:", WS_CHILD | WS_VISIBLE, 20, 130, 150, 20, hWnd, (HMENU)IDC_LBL_HOMEPAGE, GetModuleHandle(NULL), NULL);
+        HWND hEditHome = CreateWindowEx(0, L"EDIT", g_homePageUrl.c_str(), WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 20, 150, 340, 25, hWnd, (HMENU)IDC_EDIT_HOMEPAGE, GetModuleHandle(NULL), NULL);
 
-        CreateWindowEx(0, L"BUTTON", L"Save Settings", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 130, 160, 120, 30, hWnd, (HMENU)IDC_BTN_SAVESETTINGS, GetModuleHandle(NULL), NULL);
+        CreateWindowEx(0, L"BUTTON", L"Save Settings", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 130, 200, 120, 30, hWnd, (HMENU)IDC_BTN_SAVESETTINGS, GetModuleHandle(NULL), NULL);
 
         EnumChildWindows(hWnd, [](HWND hwnd, LPARAM lParam) -> BOOL {
             SendMessage(hwnd, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
@@ -435,6 +527,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 
             HWND hChkExt = GetDlgItem(hWnd, IDC_CHK_EXTENSIONS);
             g_extensionsEnabled = (SendMessage(hChkExt, BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+            g_searchEngine = SendMessage(GetDlgItem(hWnd, IDC_CMB_SEARCH), CB_GETCURSEL, 0, 0);
 
             HWND hEditHome = GetDlgItem(hWnd, IDC_EDIT_HOMEPAGE);
             int len = GetWindowTextLength(hEditHome);
@@ -452,14 +546,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
         }
         break;
     }
-    case WM_CLOSE:
-        DestroyWindow(hWnd);
-        break;
-    case WM_DESTROY:
-        hWndSettingsWindow = NULL;
-        break;
-    default:
-        return DefWindowProc(hWnd, message, wParam, lParam);
+    case WM_CLOSE: DestroyWindow(hWnd); break;
+    case WM_DESTROY: hWndSettingsWindow = NULL; break;
+    default: return DefWindowProc(hWnd, message, wParam, lParam);
     }
     return 0;
 }
@@ -498,6 +587,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         int wmId = LOWORD(wParam);
         int currentTab = TabCtrl_GetCurSel(hWndTabs);
 
+        if (wmId >= BOOKMARK_BASE_ID && wmId < BOOKMARK_BASE_ID + g_bookmarks.size()) {
+            int idx = wmId - BOOKMARK_BASE_ID;
+            std::wstring bUrl = g_bookmarks[idx].url;
+            if (currentTab >= 0 && currentTab < g_tabs.size() && g_tabs[currentTab].webview) {
+                g_tabs[currentTab].webview->Navigate(bUrl.c_str());
+                SetWindowTextW(hWndEdit, bUrl.c_str());
+            }
+            else {
+                CreateNewTab(bUrl);
+            }
+            return 0;
+        }
+
         if (wmId == IDC_INCOGNITO_BUTTON) {
             wchar_t exePath[MAX_PATH];
             GetModuleFileName(NULL, exePath, MAX_PATH);
@@ -505,65 +607,3 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         else if (wmId == IDC_SETTINGS_BUTTON) {
             if (!IsWindow(hWndSettingsWindow)) {
-                hWndSettingsWindow = CreateWindowEx(0, L"SettingsWindowClass", L"UBrowse Settings", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 400, 300, hWndMain, NULL, GetModuleHandle(NULL), NULL);
-            }
-            else {
-                SetForegroundWindow(hWndSettingsWindow);
-            }
-        }
-        else if (wmId == IDC_NEW_TAB_BUTTON) {
-            CreateNewTab(g_homePageUrl);
-        }
-        else if (wmId == IDC_CLOSE_TAB_BUTTON) {
-            if (currentTab >= 0 && (size_t)currentTab < g_tabs.size()) {
-                if (g_tabs[currentTab].controller) g_tabs[currentTab].controller->Close();
-                g_tabs.erase(g_tabs.begin() + currentTab);
-                TabCtrl_DeleteItem(hWndTabs, currentTab);
-
-                if (g_tabs.empty()) {
-                    PostQuitMessage(0);
-                }
-                else {
-                    int newSel = (currentTab >= (int)g_tabs.size()) ? (int)g_tabs.size() - 1 : currentTab;
-                    TabCtrl_SetCurSel(hWndTabs, newSel);
-                    if (g_tabs[newSel].controller) g_tabs[newSel].controller->put_IsVisible(TRUE);
-                    RECT rect; GetClientRect(hWnd, &rect);
-                    ResizeLayout(static_cast<int>(rect.right), static_cast<int>(rect.bottom));
-                }
-            }
-        }
-        else if (currentTab >= 0 && (size_t)currentTab < g_tabs.size() && g_tabs[currentTab].webview) {
-            auto webview = g_tabs[currentTab].webview;
-            if (wmId == IDC_GO_BUTTON) {
-                int length = GetWindowTextLength(hWndEdit);
-                if (length > 0) {
-                    std::vector<wchar_t> buffer(length + 1);
-                    GetWindowTextW(hWndEdit, &buffer[0], length + 1);
-                    std::wstring url(&buffer[0]);
-
-                    if (url == L"ubrowse://flap") {
-                        webview->NavigateToString(FLAPPY_BIRD_HTML);
-                    }
-                    else if (url == L"ubrowse://history") {
-                        std::wstring histHtml = GenerateHistoryHTML();
-                        webview->NavigateToString(histHtml.c_str());
-                    }
-                    else {
-                        if (url.find(L"://") == std::wstring::npos) {
-                            url = L"https://" + url;
-                            SetWindowTextW(hWndEdit, url.c_str());
-                        }
-                        webview->Navigate(url.c_str());
-                    }
-                }
-            }
-            else if (wmId == IDC_BACK_BUTTON) { BOOL cb; webview->get_CanGoBack(&cb); if (cb) webview->GoBack(); }
-            else if (wmId == IDC_FORWARD_BUTTON) { BOOL cf; webview->get_CanGoForward(&cf); if (cf) webview->GoForward(); }
-        }
-        break;
-    }
-    case WM_DESTROY: PostQuitMessage(0); break;
-    default: return DefWindowProc(hWnd, message, wParam, lParam);
-    }
-    return 0;
-}
